@@ -1,5 +1,5 @@
  Defaults: &default
-  path_BSE_SchemeData: ./reference/SchemeData0111251523SS.csv
+  path_BSE_SchemeData: ./reference/SCHMSTRPHY_04112025.csv
   final Columns: &default_columns
   - Name of Instrument
   - ISIN

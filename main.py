@@ -12,7 +12,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # ---------- logger setup ----------
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-        filename='parser.log',
+        # filename='parser.log',
         level=logging.DEBUG,  # or ERROR
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         encoding='utf-8'
