@@ -18,167 +18,18 @@ performing two main post-parsing operations:
 The class is designed to be run after all AMC parsers complete execution.
 """
 
-from asyncio import base_subprocess
-from genericpath import exists
 import os
 import re
-from tkinter.tix import COLUMN
 import yaml
 import logging
 import pandas as pd
 import numpy as np
 from fuzzywuzzy import process
 
-# -------------------------------------------------------------------
-# Logger setup
-# -------------------------------------------------------------------
+# Configuration & Constants
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# Class Definition
-# -------------------------------------------------------------------
-class PortfolioPostProcessor:
-    """
-    Unified class combining data cleaning and final compilation steps.
-
-    Attributes:
-        configs (dict): Parsed configuration from YAML file.
-        output_folder (str): Directory containing pre-cleaned files (.cleaned).
-        final_folder (str): Directory for saving cleaned results (.final_cleaned).
-    """
-
-    def __init__(self, config_path="./config/amc_configs.yaml"):
-        """
-        Initialize the post-processor by loading configuration
-        and preparing output directories.
-
-        Args:
-            config_path (str): Path to the AMC configuration YAML file.
-        """
-        with open(config_path, "r") as f:
-            self.configs = yaml.safe_load(f)
-        default_config = self.configs.get("Defaults", {})
-        self.path_bse_schemedata = default_config.get("path_BSE_SchemeData", 
-                                                      r"reference\SchemeData0111251523SS.csv")
-        if(not os.path.exists(self.path_bse_schemedata)):
-            logger.error(f"Error Initializing PortfolioPostProcessor as BSE Scheme Data Path is invalid\n"+
-                         f"{self.path_bse_schemedata}")
-            print(f"Invalid Path BSE Scheme Data Table. {self.path_bse_schemedata}")
-            exit(1)
-        
-        self.output_folder = ".cleaned"
-        self.final_folder = ".final_cleaned"
-        os.makedirs(self.output_folder, exist_ok=True)
-        os.makedirs(self.final_folder, exist_ok=True)
-        logger.info("Initialized PortfolioPostProcessor with configuration file loaded.")
-
-    # -------------------------------------------------------------------
-    # Step 1: Data Cleaning
-    # -------------------------------------------------------------------
-    def clean_data(self):
-        """
-        Clean each Excel file in `.cleaned` folder using numeric parsing
-        and AMC-specific scaling factors. Save cleaned files to `.final_cleaned`.
-        """
-
-        # inline regex-based number extractors
-        floatFilter = lambda x: re.findall(r"-?\d+\.\d+", str(x))
-        integerFilter = lambda x: re.findall(r"-?\d+", str(x))
-
-        def cleanString(s):
-            """Convert strings with symbols and text into numeric values."""
-            s = re.sub("%", "", str(s))
-            try:
-                return float(s)
-            except Exception:
-                pass
-            s1 = floatFilter(s)
-            if s1:
-                return float(s1[0])
-            s2 = integerFilter(s)
-            if s2:
-                return float(s2[0])
-            return 0.0
-
-        def dropCriteria(row):
-            """
-            Filter out rows where:
-            - NAV % > 100.0
-            - Both quantity and market value are zero
-            """
-            quantity, mkt, nav = row.iloc[4:7]
-            return not ((nav > 100.0) or (quantity == 0 and mkt == 0))
-
-        # -------------------------------------------------------------------
-        # Iterate over all intermediate Excel outputs
-        # -------------------------------------------------------------------
-        files = [f for f in os.listdir(self.output_folder) if "~" not in f]
-        logger.info(f"Starting data cleaning for {len(files)} files in {self.output_folder}")
-
-        for filename in files:
-            file_path = os.path.join(self.output_folder, filename)
-            df = pd.read_excel(file_path)
-
-            amc_name = df["AMC"].unique()[0]
-            config = self.configs.get(amc_name, {})
-            logger.info(f"Cleaning data for AMC: {amc_name}")
-
-            # AMC-level scaling parameters
-            scale_by_hundred = [s.lower() for s in config.get("Scale100", [])]
-            factor_by_hundred = [s.lower() for s in config.get("Scale100th", [])]
-
-            numeric_columns = [
-                "coupon", "quantity", "market value (mkt) ( rs lakh )",
-                "% to net assets (nav)", "yield", "yield to call (ytc)"
-            ]
-
-            # Clean and rescale numeric columns
-            for col in numeric_columns:
-                if col in df.columns:
-                    df[col] = df[col].map(cleanString).astype(np.float64)
-                    if col in factor_by_hundred:
-                        df[col] = df[col] / 100
-                    if col in scale_by_hundred:
-                        df[col] = df[col] * 100
-                    df[col] = df[col].fillna(0)
-
-            # Standardize ISIN and yield columns
-            df["isin"] = df["isin"].apply(lambda x: str(x)[:12])
-            if "% to net assets (nav)" in df.columns:
-                df["% to net assets (nav)"] = 100 * df["% to net assets (nav)"]
-            if "yield" in df.columns:
-                df["yield"] = 100 * df["yield"]
-            if "yield to call (ytc)" in df.columns:
-                df["yield to call (ytc)"] = 100 * df["yield to call (ytc)"]
-
-            # Apply filter and write cleaned output
-            df = df[df.apply(dropCriteria, axis=1)]
-            df.to_excel(os.path.join(self.final_folder, filename), index=False)
-            logger.info(f"Cleaned and saved file → {filename}")
-
-    # -------------------------------------------------------------------
-    # Step 2: Final Compilation
-    # -------------------------------------------------------------------
-    def compile_final_output(self):
-        """
-        Combine all cleaned files from `.final_cleaned` folder,
-        apply fuzzy category mapping, and export consolidated CSV.
-        """
-        files = [f for f in os.listdir(self.final_folder) if "~" not in f]
-        if not files:
-            logger.warning("No cleaned files found to compile. Exiting.")
-            return
-
-        df = pd.concat(
-            [pd.read_excel(os.path.join(self.final_folder, f)) for f in files],
-            ignore_index=True
-        )
-        logger.info(f"Compiling {len(files)} cleaned workbooks into unified dataset")
-
-        # -------------------------------------------------------------------
-        # Category Mapping (domain classification of investment types)
-        # -------------------------------------------------------------------       
-        category_mapping = {
+CATEGORY_MAPPING = {
             # Equity & Equity Related
             'EQUITY & EQUITY RELATED': 'Equity & Equity Related',
             'Equity & Equity Related': 'Equity & Equity Related',
@@ -217,6 +68,7 @@ class PortfolioPostProcessor:
             'FOREIGNETF': 'Exchange Traded Funds (ETFs)',
 
             # Bonds & Debentures
+            'Corporate Debt Market Development Fund Class': 'Bonds & Debentures',
             'BOND & NCDs': 'Bonds & Debentures',
             'Bonds': 'Bonds & Debentures',
             'Debentures and Bonds': 'Bonds & Debentures',
@@ -326,95 +178,240 @@ class PortfolioPostProcessor:
             'uncategorised': 'Other/Uncategorized'
         }
 
-        keys = list(category_mapping.keys())
-        keys = [k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k) for k in keys]
+NOISE_WORDS = [
+    "direct", "regular", "growth", "dividend", "div", "option", "plan", 
+    "payout", "reinvestment", "bonus", "cumulative", "institutional", 
+    "retail", "segregated", "portfolio", "idcw", "series",
+    "and", "quarterly", "monthly", "weekly", "daily", "annual"
+]
 
-        def fuzzy_map_entries_to_category(entries):
-            """
-            Perform fuzzy text matching to classify instrument types
-            into standardized category labels.
-            """
-            results = {}
-            for entry in entries:
-                if not keys:
-                    results[entry] = "others"
-                else:
-                    if isinstance(entry, bytes):
-                        entry = entry.decode("utf-8", errors="ignore")
-                    match, score = process.extractOne(str(entry), keys)
-                    results[entry] = category_mapping.get(match, "others")
-            return results
+# Class Definition
+class PortfolioPostProcessor:
+    """
+    Unified class combining data cleaning, standardization, and enrichment steps.
+    """
 
-        # apply fuzzy category mapping to "Type" column
-        if "Type" in df.columns:
-            df["Type"] = df["Type"].map(
-                fuzzy_map_entries_to_category(np.unique(df["Type"]))
+    def __init__(self, config_path="./config/amc_configs.yaml"):
+        with open(config_path, "r") as f:
+            self.configs = yaml.safe_load(f)
+        
+        default_config = self.configs.get("Defaults", {})
+        self.path_bse_schemedata = default_config.get(
+            "path_BSE_SchemeData", r"reference\SchemeData0111251523SS.csv"
+        )
+
+        if not os.path.exists(self.path_bse_schemedata):
+            logger.error(f"Invalid BSE Scheme Data Path: {self.path_bse_schemedata}")
+            print(f"Invalid Path BSE Scheme Data Table: {self.path_bse_schemedata}")
+            exit(1)
+        
+        self.output_folder = ".cleaned"
+        self.final_folder = ".final_cleaned"
+        os.makedirs(self.output_folder, exist_ok=True)
+        os.makedirs(self.final_folder, exist_ok=True)
+        logger.info("Initialized PortfolioPostProcessor.")
+
+    # Helper Methods
+    @staticmethod
+    def _clean_numeric_string(s):
+        """Convert dirty strings (e.g. '12.5%') to float."""
+        s = re.sub("%", "", str(s))
+        try:
+            return float(s)
+        except ValueError:
+            # Fallback to regex extraction
+            if match := re.findall(r"-?\d+\.\d+", str(s)):
+                return float(match[0])
+            if match := re.findall(r"-?\d+", str(s)):
+                return float(match[0])
+            return 0.0
+
+    @staticmethod
+    def _standardize_scheme_name(scheme_name):
+        """Normalize scheme names for matching by removing noise words."""
+        name = str(scheme_name).lower()
+        name = re.sub(r"\(.*?\)", "", name)  # Remove content in brackets
+        
+        # Remove noise words (whole words only)
+        pattern = r'\b(?:{})\b'.format('|'.join(NOISE_WORDS))
+        name = re.sub(pattern, "", name)
+        
+        # Remove specific prefixes/suffixes
+        for phrase in ["- an.*", "-an.*", "as on.*", "scheme having.*"]:
+            name = re.sub(phrase, "", name)
+
+        # Clean special chars and spacing
+        name = re.sub(r"[^a-z0-9]", " ", name)
+        return re.sub(r"\s+", " ", name).strip()
+
+    @staticmethod
+    def _fuzzy_map_category(entries, keys):
+        """Map list of entries to standardized categories using fuzzy matching."""
+        results = {}
+        for entry in entries:
+            if not keys:
+                results[entry] = "others"
+                continue
+            
+            entry_str = entry.decode("utf-8", errors="ignore") if isinstance(entry, bytes) else str(entry)
+            match, _ = process.extractOne(entry_str, keys)
+            results[entry] = CATEGORY_MAPPING.get(match, "others")
+        return results
+
+    # Core Operations
+    def clean_data(self):
+        """Read intermediate files, normalize numbers, apply scaling, and save."""
+        files = [f for f in os.listdir(self.output_folder) if "~" not in f]
+        logger.info(f"Starting data cleaning for {len(files)} files.")
+
+        numeric_cols = [
+            "coupon", "quantity", "market value (mkt) ( rs lakh )",
+            "% to net assets (nav)", "yield", "yield to call (ytc)"
+        ]
+
+        for filename in files:
+            file_path = os.path.join(self.output_folder, filename)
+            df = pd.read_excel(file_path)
+            amc_name = df["AMC"].unique()[0]
+            config = self.configs.get(amc_name, {})
+            
+            logger.info(f"Cleaning data for AMC: {amc_name}")
+
+            # Scaling factors
+            scale_100 = [s.lower() for s in config.get("Scale100", [])]
+            scale_100th = [s.lower() for s in config.get("Scale100th", [])]
+
+            # Process numeric columns
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = df[col].map(self._clean_numeric_string).astype(np.float64)
+                    if col in scale_100th: df[col] /= 100
+                    if col in scale_100:   df[col] *= 100
+                    df[col] = df[col].fillna(0)
+
+            # Standardize Text Columns
+            df["isin"] = df["isin"].apply(lambda x: str(x)[:12])
+            
+            # Apply specific column logic
+            if "% to net assets (nav)" in df.columns:
+                df["% to net assets (nav)"] *= 100
+            for y_col in ["yield", "yield to call (ytc)"]:
+                if y_col in df.columns:
+                    df[y_col] *= 100
+
+            # Filter invalid rows (nav > 100 or empty value/qty)
+            valid_mask = df.apply(
+                lambda r: not ((r.iloc[6] > 100.0) or (r.iloc[4] == 0 and r.iloc[5] == 0)), 
+                axis=1
             )
+            df = df[valid_mask]
+            
+            df.to_excel(os.path.join(self.final_folder, filename), index=False)
+            logger.info(f"Saved cleaned file: {filename}")
 
-        # drop yield-to-call column if present
+    def compile_final_output(self):
+        """Merge cleaned files, categorize, enrich with BSE data, and export."""
+        files = [f for f in os.listdir(self.final_folder) if "~" not in f]
+        if not files:
+            logger.warning("No files found to compile.")
+            return
+
+        df = pd.concat(
+            [pd.read_excel(os.path.join(self.final_folder, f)) for f in files],
+            ignore_index=True
+        )
+        logger.info(f"Compiling {len(files)} workbooks.")
+
+        # 1. Fuzzy Category Mapping
+        if "Type" in df.columns:
+            mapping_keys = [str(k) for k in CATEGORY_MAPPING.keys()]
+            unique_types = np.unique(df["Type"].astype(str))
+            type_map = self._fuzzy_map_category(unique_types, mapping_keys)
+            df["Type"] = df["Type"].map(type_map)
+
+        # 2. Column Cleanup
         if "yield to call (ytc)" in df.columns:
             df = df.drop("yield to call (ytc)", axis=1)
 
-        # standardize final column names
-        new_cols = [
-            "Name of Instrument", "ISIN", "Coupon", "Industry", "Quantity",
-            "Market Value", "% to Net Assets", "Yield", "Type",
-            "Scheme Name", "AMC"
+        final_columns = [
+            "Name of Instrument", "Instrument ISIN", "Coupon", "Industry", "Quantity",
+            "Market Value", "% to Net Assets", "Yield", "Type", "Scheme Name", "AMC"
         ]
-        if len(df.columns) == len(new_cols):
-            df.columns = new_cols
+        if len(df.columns) == len(final_columns):
+            df.columns = final_columns
 
-        # join Scheme ISIN and Amfi Code
+        # 3. Enrich with BSE Data
         df = self._join_bse_schemedata(df)
 
-        # export final combined output
-        df.to_csv(f"Portfolio_extracted_{pd.Timestamp.today().strftime('%d%m%y-%H%M')}.csv", index=False)
-        logger.info("Final combined CSV successfully.")
+        # 4. Final Data Repairs
+        # Force numeric types for Quantity/MarketValue/NAV (cols 4,5,6)
+        cols_to_fix = df.columns[4:7]
+        df[cols_to_fix] = df[cols_to_fix].apply(pd.to_numeric, errors='coerce').fillna(0)
 
-    # -------------------------------------------------------------------
-    # Step 3: Scheme ISIN and Amfi Code addition
-    # -------------------------------------------------------------------
+        # Fix negative values (e.g. Tata MF quirks)
+        neg_idxs = df[(df.iloc[:, 4:7] <= 0).all(axis=1)].index.tolist()
+        df.loc[neg_idxs, df.columns[4:7]] *= -1
+
+        # 5. Debug Mismatches
+        target_col = "BSE Scheme Code"
+        if target_col in df.columns:
+            mismatches = df[df[target_col].isna()]["Scheme Name"].unique()
+            if len(mismatches) > 0:
+                print("\n" + "="*60)
+                print(f"⚠️  MISMATCH: {len(mismatches)} Schemes failed to match BSE data:")
+                print("-" * 60)
+                for name in mismatches[:10]: print(f"   • {name}")
+                if len(mismatches) > 10: print(f"   ... and {len(mismatches)-10} more.")
+                print("="*60 + "\n")
+
+        # Export
+        filename = f"Portfolio_extracted_{pd.Timestamp.today().strftime('%d%m%y-%H%M')}.csv"
+        df.to_csv(filename, index=False)
+        logger.info("Pipeline completed successfully.")
+
     def _join_bse_schemedata(self, portfolio_df: pd.DataFrame):
-        def _standardize_scheme_name(scheme_name):
-            patterns  =  ["- an.*","-an.*", r"\(an.*", r"\( an.*", r"\([^)]*\)", "as on.*", "scheme having.*"]
-            scheme_name = str(scheme_name)
-            scheme_name = scheme_name.lower()
-            for pattern in patterns:
-                scheme_name = re.sub(pattern, "", scheme_name)
-            scheme_name = re.sub( r"[^a-z0-9\- ]", " ", scheme_name)
-            scheme_name = re.sub(r"\s+"," ",scheme_name)
+        """Enrich portfolio data with ISINs and Scheme Codes from BSE Master file."""
+        
+        # Load BSE File
+        try:
+            df_ref = pd.read_csv(self.path_bse_schemedata, encoding='latin1', low_memory=False)
+        except (UnicodeDecodeError, FileNotFoundError):
+            try:
+                df_ref = pd.read_csv(self.path_bse_schemedata, low_memory=False)
+            except FileNotFoundError:
+                logger.error("BSE Scheme file not found. Skipping enrichment.")
+                return portfolio_df
 
-            return scheme_name.strip().lower()
+        # Standardize BSE Names
+        df_ref["Scheme Name"] = df_ref["Scheme Name"].apply(self._standardize_scheme_name)
 
+        # Prepare Reference Map (Group by Name, Deduplicate Codes)
+        ref_data = df_ref.astype(str).groupby("Scheme Name").agg({
+            "ISIN": lambda x: ",".join(sorted(set(x))),
+            "Scheme Code": lambda x: ",".join(sorted(set(x)))
+        }).reset_index()
 
+        # Explicit Rename for Clarity
+        ref_data = ref_data.rename(columns={
+            "ISIN": "raw_bse_isin",
+            "Scheme Code": "BSE Scheme Code"
+        })
 
-        df = pd.read_csv(r"reference\SchemeData0111251523SS.csv")
-        df["Scheme Name"]  = df["Scheme Name"].apply(_standardize_scheme_name)
-
-
-
+        # Merge
         isin_pattern = r"[A-Z]{3}[A-Z0-9]{9}"
-        additional_df = (
+        
+        return (
             portfolio_df.merge(
-                df.astype(str).groupby("Scheme Name").agg({
-                        "ISIN Div Payout/ ISIN GrowthISIN Div Reinvestment": ", ".join,
-                        "Code": ",".join
-                    }).reset_index()
-                    .assign(
-                    **{
-                        "ISIN Div Payout/ ISIN GrowthISIN Div Reinvestment": 
-                            lambda x: x["ISIN Div Payout/ ISIN GrowthISIN Div Reinvestment"]
-                                        .apply(lambda s: ",".join(re.findall(isin_pattern, s)))
-                    }
-                ),
-                how = "left",
-                left_on = portfolio_df["Scheme Name"].astype(str).apply(_standardize_scheme_name),
-                right_on = "Scheme Name",
-                suffixes=("","_df")
+                ref_data,
+                how="left",
+                left_on=portfolio_df["Scheme Name"].astype(str).apply(self._standardize_scheme_name),
+                right_on="Scheme Name"
             )
-            # .drop(columns=["Scheme Name_df"])
-            .rename(columns = {"Code":"amfi_code",
-                               "ISIN Div Payout/ ISIN GrowthISIN Div Reinvestment":"isin_group"})
-        )               
-
-        return additional_df                                                                                                    
+            .drop(columns=["Scheme Name_y"], errors='ignore')
+            .assign(
+                isin_group=lambda x: x["raw_bse_isin"].apply(
+                    lambda s: ",".join(re.findall(isin_pattern, str(s))) if pd.notna(s) else ""
+                )
+            )
+            .drop(columns=["raw_bse_isin"])
+        )
