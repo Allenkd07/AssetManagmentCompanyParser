@@ -309,6 +309,61 @@ class PortfolioPostProcessor:
             df.to_excel(os.path.join(self.final_folder, filename), index=False)
             logger.info(f"Saved cleaned file: {filename}")
 
+    def _join_bse_schemedata(self, portfolio_df: pd.DataFrame):
+        """Enrich data with BSE ISINs and standardize Scheme Names to Title Case."""
+        
+        # 1. Load BSE Reference File
+        try:
+            df_ref = pd.read_csv(self.path_bse_schemedata, encoding='latin1', low_memory=False)
+        except (UnicodeDecodeError, FileNotFoundError):
+            try:
+                df_ref = pd.read_csv(self.path_bse_schemedata, low_memory=False)
+            except FileNotFoundError:
+                logger.error("BSE Scheme file not found. Skipping enrichment.")
+                return portfolio_df
+
+        # 2. Prepare Reference Data
+        # Generate standardized match key and aggregate ISINs into a unique list
+        df_ref["match_key"] = df_ref["Scheme Name"].apply(self._standardize_scheme_name)
+        
+        ref_data = df_ref.groupby("match_key").agg({
+            "ISIN": lambda x: list(sorted(set(x)))
+        }).reset_index()
+
+        # Generate official display name (Title Case) from the standardized key
+        ref_data["BSE_Cleaned_Name"] = ref_data["match_key"].str.title()
+        ref_data = ref_data.rename(columns={"ISIN": "bse_isin_list"})
+
+        # 3. Merge Data
+        # Join Portfolio data with BSE data using the standardized key
+        merged_df = portfolio_df.merge(
+            ref_data,
+            how="left",
+            left_on=portfolio_df["Scheme Name"].astype(str).apply(self._standardize_scheme_name),
+            right_on="match_key"
+        )
+
+        # 4. Name Normalization
+        # Prioritize Title-Cased BSE name; fallback to original Excel name if no match found
+        merged_df["Scheme Name"] = merged_df["BSE_Cleaned_Name"].fillna(merged_df["Scheme Name"])
+        
+        # Remove intermediate merge columns and duplicate name columns
+        cols_to_drop = ["match_key", "BSE_Cleaned_Name", "Scheme Name_y", "Scheme Name_x"]
+        merged_df = merged_df.drop(columns=cols_to_drop, errors='ignore')
+
+        # 5. Expand and Validate ISINs
+        # Explode list of ISINs into separate rows
+        exploded_df = merged_df.explode("bse_isin_list").rename(columns={"bse_isin_list": "Scheme ISIN"})
+
+        # Keep only valid ISIN formats or empty values (for unmatched schemes)
+        isin_pattern = r"^[A-Z]{3}[A-Z0-9]{9}$"
+        mask = (
+            exploded_df["Scheme ISIN"].astype(str).str.match(isin_pattern, na=False) | 
+            exploded_df["Scheme ISIN"].isna()
+        )
+        
+        return exploded_df[mask]
+    
     def compile_final_output(self):
         """Merge cleaned files, categorize, enrich with BSE data, and export."""
         files = [f for f in os.listdir(self.final_folder) if "~" not in f]
@@ -368,50 +423,3 @@ class PortfolioPostProcessor:
         filename = f"Portfolio_extracted_{pd.Timestamp.today().strftime('%d%m%y-%H%M')}.csv"
         df.to_csv(filename, index=False)
         logger.info("Pipeline completed successfully.")
-
-    def _join_bse_schemedata(self, portfolio_df: pd.DataFrame):
-        """Enrich portfolio data with ISINs and Scheme Codes from BSE Master file."""
-        
-        # Load BSE File
-        try:
-            df_ref = pd.read_csv(self.path_bse_schemedata, encoding='latin1', low_memory=False)
-        except (UnicodeDecodeError, FileNotFoundError):
-            try:
-                df_ref = pd.read_csv(self.path_bse_schemedata, low_memory=False)
-            except FileNotFoundError:
-                logger.error("BSE Scheme file not found. Skipping enrichment.")
-                return portfolio_df
-
-        # Standardize BSE Names
-        df_ref["Scheme Name"] = df_ref["Scheme Name"].apply(self._standardize_scheme_name)
-
-        # Prepare Reference Map (Group by Name, Deduplicate Codes)
-        ref_data = df_ref.astype(str).groupby("Scheme Name").agg({
-            "ISIN": lambda x: ",".join(sorted(set(x))),
-            "Scheme Code": lambda x: ",".join(sorted(set(x)))
-        }).reset_index()
-
-        # Explicit Rename for Clarity
-        ref_data = ref_data.rename(columns={
-            "ISIN": "raw_bse_isin",
-            "Scheme Code": "BSE Scheme Code"
-        })
-
-        # Merge
-        isin_pattern = r"[A-Z]{3}[A-Z0-9]{9}"
-        
-        return (
-            portfolio_df.merge(
-                ref_data,
-                how="left",
-                left_on=portfolio_df["Scheme Name"].astype(str).apply(self._standardize_scheme_name),
-                right_on="Scheme Name"
-            )
-            .drop(columns=["Scheme Name_y"], errors='ignore')
-            .assign(
-                isin_group=lambda x: x["raw_bse_isin"].apply(
-                    lambda s: ",".join(re.findall(isin_pattern, str(s))) if pd.notna(s) else ""
-                )
-            )
-            .drop(columns=["raw_bse_isin"])
-        )
